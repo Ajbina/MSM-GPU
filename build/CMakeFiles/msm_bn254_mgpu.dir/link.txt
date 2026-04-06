@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ -Wl,--dependency-file=CMakeFiles/msm_bn254_mgpu.dir/link.d @CMakeFiles/msm_bn254_mgpu.dir/objects1.rsp -o msm_bn254_mgpu @CMakeFiles/msm_bn254_mgpu.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

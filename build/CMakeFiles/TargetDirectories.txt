@@ -1,0 +1,3 @@
+/home/syn324/projects/msm-gpu/build/CMakeFiles/msm_bn254_mgpu.dir
+/home/syn324/projects/msm-gpu/build/CMakeFiles/edit_cache.dir
+/home/syn324/projects/msm-gpu/build/CMakeFiles/rebuild_cache.dir

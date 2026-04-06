@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/syn324/projects/msm-gpu/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
