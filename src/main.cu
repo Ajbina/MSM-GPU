@@ -349,10 +349,13 @@ int main(int argc, char** argv) {
       params.L_d2h  = 2e-5;
       // GPU-reduction pipeline calibration (Apr 6): Updated with kernel timing scope fix
       // Previous: 0.26 (legacy host-merge model) → 5.36 (Mar 31)
-      // Calibrated from audit runs: N=10000, wbits=8 now suggests k_compute_mid ~ 11.0854
-      params.k_compute_small = 5.20;   // wbits <= 6
+      // Calibrated from audit runs: N=10000
+      // - wbits=6: k_compute_small = 5.84 (was 5.20)
+      // - wbits=8: k_compute_mid = 11.0854 (was 5.36)
+      // - wbits=10: k_compute_large = 8.91 (was 5.40)
+      params.k_compute_small = 5.84;   // wbits <= 6 (newly calibrated)
       params.k_compute_mid   = 11.0854;   // 7 <= wbits <= 8 (newly calibrated after kernel timing fix)
-      params.k_compute_large = 5.40;   // wbits >= 9
+      params.k_compute_large = 8.91;   // wbits >= 9 (newly calibrated)
       params.alpha_pack   = 2.8e-08;
       // GPU merge and suffix operations: coefficients now in make_plan (5.0e-8, 1.0e-8)
       params.tpb      = 256;
