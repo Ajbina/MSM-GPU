@@ -84,7 +84,7 @@ __global__ void merge_local_bucket_sums(
   }
 }
 
-// WARNING: legacy helper, not used in the current split-aware pipeline.
+// not used in the current split-aware pipeline.
 // Not safe for split buckets because it overwrites instead of accumulating
 // when multiple local sums map to the same logical bucket.
 __global__ void scatter_bucket_sums(
@@ -95,7 +95,7 @@ __global__ void scatter_bucket_sums(
   full_sums[b] = local_sums[i];
 }
 
-// Legacy GPU window reduction helper.
+// GPU window reduction helper.
 // Safe only when launched such that a single thread performs the reduction.
 __global__ void window_reduce_suffix(const G1J* bucket_sums, int B, G1J* out_one) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {

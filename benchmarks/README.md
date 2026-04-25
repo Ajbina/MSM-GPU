@@ -11,7 +11,7 @@ python3 run_benchmark.py
 
 ## What It Does
 
-- **Runs** ./msm_bn254_mgpu for N ∈ {1M, 5M, 10M, 20M, 35M, 50M}
+- **Runs** ./msm_bn254_mgpu for N ∈ {1M, 5M, 10M, 20M, 35M, 50M, 60M}
 - **Tests** two modes per N:
   - `even`: Static round-robin distribution (use_greedy=0)
   - `greedy`: Greedy planner-driven distribution (use_greedy=1)
@@ -22,7 +22,7 @@ python3 run_benchmark.py
   - Prediction error percentage
   - Throughput (points/sec)
 - **Saves** results to:
-  - `benchmark_N1000000.csv` through `benchmark_N50000000.csv` (per-size)
+  - `benchmark_N1000000.csv` through `benchmark_N60000000.csv` (per-size)
   - `benchmark_final_all.csv` (combined overview)
 
 ## Output Files
@@ -46,7 +46,7 @@ N,wbits,mode,num_gpus,k_compute_mid,alpha_pack,k_digit,k_count,...
 1000000,8,even,2,11.0854,2.8e-08,1.5e-09,...
 1000000,8,greedy,2,11.0854,2.8e-08,1.5e-09,...
 ...
-50000000,8,greedy,2,11.0854,2.8e-08,1.5e-09,...
+60000000,8,greedy,2,11.0854,2.8e-08,1.5e-09,...
 ```
 
 ## Fields Captured
@@ -96,7 +96,7 @@ N=1M,  greedy: avg_window=0.0601ms  ← nearly equivalent
 
 ### 2. Prediction Accuracy
 - `prediction_error_pct` in single digits is typical after model convergence
-- Current full sweep: average absolute error is about 7.8%, max about 10.5%
+- Current full sweep: average absolute error is about 8.0%, max about 10.45%
 - N=1M currently lands near zero (~-1% to -0.8%)
 
 ### 3. Scaling Behavior
@@ -158,7 +158,7 @@ Both modes benefit from overhead learning:
 
 ### Script hangs/times out
 - Increase subprocess timeout in `run_benchmark.py` (line ~95)
-- Check if N=35M or N=50M datasets exist
+- Check if N=35M, N=50M, or N=60M datasets exist
 - Monitor GPU temperature (`nvidia-smi`)
 
 ### Missing fields in output

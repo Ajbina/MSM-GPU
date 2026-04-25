@@ -24,9 +24,13 @@ struct SystemParams {
     double k_compute_small;  // compute correction for wbits <= 6
     double k_compute_mid;    // compute correction for 7 <= wbits <= 8
     double k_compute_large;  // compute correction for wbits >= 9
-    // Active host-side linear terms.
+    // PHASE 1: GPU digit extraction and bucket counting costs
+    double k_digit;      // time per scalar for kernel_compute_digits
+    double k_count;      // time per scalar for kernel_count_buckets
+    // Host-side and GPU-side linear terms
     double alpha_pack;   // host packing time per point
-    // Note: GPU merge and suffix operations now modeled separately in make_plan
+    double k_merge;      // time per task for GPU merge_local_bucket_sums kernel
+    double k_suffix;     // time per bucket for GPU window_reduce_suffix kernel
     int    tpb;      // threads per block used by bucket_sum_block_per_bucket
     int    num_sms;  // number of GPU streaming multiprocessors
     size_t M_g;      // effective per-GPU memory budget used by planner
@@ -75,10 +79,12 @@ struct BucketPlan {
   // Memory used per GPU (bytes) to enforce limits
   std::vector<size_t> gpu_memory;
   // Host-side and GPU stage estimates for the current window.
+  double estimated_phase1_digit_time = 0.0;     // PHASE 1: kernel_compute_digits
+  double estimated_phase1_count_time = 0.0;     // PHASE 1: kernel_count_buckets
   double estimated_host_pack_time = 0.0;
   double estimated_gpu_merge_time = 0.0;        // GPU merge_local_bucket_sums kernel
   double estimated_gpu_suffix_time = 0.0;       // GPU window_reduce_suffix kernel
-  double estimated_staged_total_time = 0.0;     // Total: pack + h2d + compute + gpu_merge + gpu_suffix + d2h
+  double estimated_staged_total_time = 0.0;     // Total: phase1 + pack + h2d + compute + gpu_merge + gpu_suffix + d2h
   // Estimated cost of the window reduction (T_win_red)
   double estimated_reduction_cost = 0.0;
 };
@@ -105,11 +111,13 @@ inline double get_k_compute_for_wbits(int wbits, const SystemParams& params) {
 
 // Plan buckets across GPUs using an analytical cost model and optional constraints
 // objective toggles throughput vs latency minimization; max_mem_per_gpu caps VRAM
+// N: total number of scalars (needed for Phase 1 digit extraction and bucket counting costs)
 inline BucketPlan make_plan(const std::vector<int>& bucket_sizes,
                            int G,
                            Objective objective,
                            const SystemParams& params,
                            size_t max_mem_per_gpu,
+                           int N = 0,
                            int wbits = 8,
                            bool use_greedy = true) {
   // Conservative memory model for feasibility checks.
@@ -368,22 +376,29 @@ inline BucketPlan make_plan(const std::vector<int>& bucket_sizes,
     }
   }
   
-  // New GPU-based stage costs:
+  // New GPU-based stage costs (from SystemParams):
+  // PHASE 1: GPU digit extraction and bucket counting on all N scalars
+  plan.estimated_phase1_digit_time = params.k_digit * double(N);
+  plan.estimated_phase1_count_time = params.k_count * double(N);
+  
+  // PHASE 2+: Host packing, H2D/D2H transfers, GPU compute, GPU merge, and GPU window reduction
   // k_merge: time per task for GPU merge_local_bucket_sums kernel
   // k_suffix: time per bucket for GPU window_reduce_suffix kernel
-  const double k_merge = 5.0e-8;   // seconds per task
-  const double k_suffix = 1.0e-8;  // seconds per bucket
   
   plan.estimated_host_pack_time = params.alpha_pack * double(total_points);
-  plan.estimated_gpu_merge_time = k_merge * double(total_tasks);
-  plan.estimated_gpu_suffix_time = k_suffix * double(B);
   
-  // New predicted time formula (GPU-based pipeline):
-  // t_pack + t_h2d + t_compute + t_gpu_merge + t_gpu_suffix + t_d2h
+  // PHASE 2+: Bucket sums, GPU merge, and GPU window reduction
+  plan.estimated_gpu_merge_time = params.k_merge * double(total_tasks);
+  plan.estimated_gpu_suffix_time = params.k_suffix * double(B);
+  
+  // Complete predicted time formula (GPU-based pipeline, all phases):
+  // t_phase1_digit + t_phase1_count + t_pack + t_h2d + t_compute + t_gpu_merge + t_gpu_suffix + t_d2h
   double gpu_time_sum = std::accumulate(plan.gpu_estimated_time.begin(), plan.gpu_estimated_time.end(), 0.0);
   plan.estimated_staged_total_time =
-      plan.estimated_host_pack_time
-    + gpu_time_sum                    // includes t_h2d + t_compute + t_d2h per GPU
+      plan.estimated_phase1_digit_time
+    + plan.estimated_phase1_count_time
+    + plan.estimated_host_pack_time
+    + gpu_time_sum                       // includes t_h2d + t_compute + t_d2h per GPU
     + plan.estimated_gpu_merge_time
     + plan.estimated_gpu_suffix_time;
 

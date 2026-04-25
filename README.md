@@ -10,7 +10,7 @@ This project implements efficient MSM computation on NVIDIA GPUs with support fo
 - **Two execution modes**:
   - **Even mode**: Static round-robin bucket distribution (baseline)
   - **Greedy mode**: Adaptive planner-based optimization (recommended)
-- **Comprehensive benchmarking** - Scaling analysis across N=1M to 50M points
+- **Comprehensive benchmarking** - Scaling analysis across N=1M to 60M points
 
 ## Architecture
 
@@ -102,7 +102,7 @@ cd benchmarks
 python3 run_benchmark.py
 ```
 
-Runs all N ∈ [1M, 5M, 10M, 20M, 35M, 50M] × 2 modes, generates:
+Runs all N ∈ [1M, 5M, 10M, 20M, 35M, 50M, 60M] × 2 modes, generates:
 - Individual CSVs: `benchmark_N*.csv`
 - Combined: `benchmark_final_all.csv`
 
@@ -129,13 +129,14 @@ Produces:
 | 20M | 0.902ms | 0.904ms | 0.9980x | +9.67% / +9.45% |
 | 35M | 1.584ms | 1.567ms | 1.0106x | +8.73% / +9.86% |
 | 50M | 2.271ms | 2.227ms | 1.0197x | +8.05% / +10.20% |
+| 60M | 2.706ms | 2.683ms | 1.0087x | +8.79% / +9.67% |
 
 **Speedup interpretation**: Ratio = Even / Greedy
 - **< 1.0**: Greedy is faster (better) ✓
 - **≈ 1.0**: Modes equivalent
 - **> 1.0**: Even is faster (better)
 
-*Example at N=50M: Greedy is about 1.97% faster (2.227ms < 2.271ms)*
+*Example at N=60M: Greedy is about 0.87% faster (2.683ms < 2.706ms)*
 
 ### Key Findings
 
@@ -145,14 +146,14 @@ Produces:
    - Both modes achieve stable performance
 
 2. **Prediction Accuracy**:
-   - Average absolute error: **7.83%**
+   - Average absolute error: **8.03%**
    - Maximum absolute error: **10.45%**
    - N=1M now sits near zero error (about -1% to -0.8%)
 
 3. **Scaling**:
-   - Linear trend from 1M to 50M
-   - Window time grows from ~0.06ms to ~2.23-2.27ms
-   - Prediction error stays in a tighter post-fix band (~8-10% for 5M-50M)
+   - Linear trend from 1M to 60M
+   - Window time grows from ~0.06ms to ~2.68-2.71ms
+   - Prediction error stays in a tighter post-fix band (~8-10% for 5M-60M)
 
 4. **Hardware Utilization**:
    - Both GPUs: 48 SMs each, 20.5GB VRAM
@@ -202,8 +203,9 @@ Cached datasets in `build/` directory (use `use_reusable_dataset=1`):
 | 20M | dataset_N20000000.bin | 2.4GB |
 | 35M | dataset_N35000000.bin | 2.7GB |
 | 50M | dataset_N50000000.bin | 6.0GB |
+| 60M | dataset_N60000000.bin | 7.2GB |
 
-**Total: 13.6GB**
+**Total: 20.8GB**
 
 ## Implementation Details
 
