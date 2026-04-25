@@ -1,0 +1,3 @@
+M_g_bytes,N,alpha_pack,avg_predicted_ms,avg_window_ms,k_compute_large,k_compute_mid,k_compute_small,k_count,k_digit,k_merge,k_suffix,max_window_ms,min_window_ms,mode,num_gpus,num_sms,prediction_error_pct,total_predicted_ms,total_window_time_ms,wbits,window_count
+18840158208,50000000,2.8e-08,2.4536068749999997,2.27091,8.91,11.0854,5.84,1.58907e-09,1.09838e-10,1.78472e-09,7.94853e-10,5.03962,2.17484,even,2,48,8.045095358248435,78.51541999999999,72.66912,8,32
+18840158208,50000000,2.8e-08,2.454386875,2.2271199999999998,8.91,11.0854,5.84,1.55933e-09,1.09733e-10,1.87147e-09,8.3519e-10,3.91982,2.16782,greedy,2,48,10.20451861597041,78.54038,71.26783999999999,8,32
