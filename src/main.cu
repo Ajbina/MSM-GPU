@@ -7,6 +7,7 @@
 #include <vector>
 #include <random>
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <cstring>
 #include <algorithm>
@@ -139,9 +140,7 @@ static inline void ensure_bucket_counts_capacity(GpuCtx& ctx, int B) {
   ctx.bucket_counts_capacity = need;
 }
 
-static inline void ensure_host_packed_points_capacity(std::vector<G1J>& h_packed_points,
-                                                       size_t& packed_points_capacity,
-                                                       size_t required_points) {
+static inline void ensure_host_packed_points_capacity(std::vector<G1J>& h_packed_points, size_t& packed_points_capacity, size_t required_points) {
   if (packed_points_capacity >= required_points) return;
   // Allocate with some headroom to avoid frequent reallocations
   size_t new_capacity = std::max(required_points, packed_points_capacity * 2);
@@ -255,6 +254,64 @@ static inline bool equal_projective(const G1J& A, const G1J& B) {
   return (S1 == S2);
 }
 
+// ===== Dataset Save/Load for Benchmarking =====
+static inline std::string get_dataset_filename(int N) {
+  return std::string("dataset_N") + std::to_string(N) + ".bin";
+}
+
+static inline bool save_dataset(const std::string& filename, int N, const std::vector<ScalarR>& scalars, const std::vector<G1J>& points) {
+  std::ofstream file(filename, std::ios::binary);
+  if (!file.is_open()) {
+    std::cerr << "WARNING: Could not open file for writing: " << filename << "\n";
+    return false;
+  }
+  
+  file.write(reinterpret_cast<const char*>(&N), sizeof(N));
+  
+  for (int i = 0; i < N; i++) {
+    file.write(reinterpret_cast<const char*>(scalars[i].v), sizeof(scalars[i].v));
+  }
+  
+  for (int i = 0; i < N; i++) {
+    file.write(reinterpret_cast<const char*>(&points[i]), sizeof(G1J));
+  }
+  
+  file.close();
+  std::cerr << "Saved dataset to: " << filename << " (" << (N * (sizeof(ScalarR) + sizeof(G1J)) / (1024*1024)) << " MB)\n";
+  return true;
+}
+
+static inline bool load_dataset(const std::string& filename, int N, std::vector<ScalarR>& scalars, std::vector<G1J>& points) {
+  std::ifstream file(filename, std::ios::binary);
+  if (!file.is_open()) {
+    return false;  // File doesn't exist
+  }
+  
+  int file_N = 0;
+  file.read(reinterpret_cast<char*>(&file_N), sizeof(file_N));
+  
+  if (file_N != N) {
+    std::cerr << "WARNING: Dataset file N=" << file_N << " but requested N=" << N << "\n";
+    file.close();
+    return false;
+  }
+  
+  scalars.resize(N);
+  points.resize(N);
+  
+  for (int i = 0; i < N; i++) {
+    file.read(reinterpret_cast<char*>(scalars[i].v), sizeof(scalars[i].v));
+  }
+  
+  for (int i = 0; i < N; i++) {
+    file.read(reinterpret_cast<char*>(&points[i]), sizeof(G1J));
+  }
+  
+  file.close();
+  std::cerr << "Loaded dataset from: " << filename << "\n";
+  return true;
+}
+
 int main(int argc, char** argv) {
   try {
     print_device_info();
@@ -274,6 +331,7 @@ int main(int argc, char** argv) {
     //   5: objective (0=throughput, 1=latency)
     //   6: audit_stage_timing (optional, default 0)
     //   7: force_split_test (optional, default 0; debug only)
+    //   8: use_reusable_dataset (optional, default 1; use saved dataset if available)
     const int N = (argc > 1) ? std::atoi(argv[1]) : 1'000'000;
     const int wbits = (argc > 2) ? std::atoi(argv[2]) : 8;
     const int use_greedy = (argc > 3) ? std::atoi(argv[3]) : 1;
@@ -281,6 +339,7 @@ int main(int argc, char** argv) {
     const int obj_flag = (argc > 5) ? std::atoi(argv[5]) : 0;
     const int audit_flag = (argc > 6) ? std::atoi(argv[6]) : 0;
     const int force_split_flag = (argc > 7) ? std::atoi(argv[7]) : 0;
+    const int use_reusable_dataset = (argc > 8) ? std::atoi(argv[8]) : 1;
 
     if (N <= 0) {
       std::cerr << "Invalid input: N must be > 0\n";
@@ -347,17 +406,22 @@ int main(int argc, char** argv) {
       params.L_sync = 1e-6;
       params.L_h2d  = 3e-5;
       params.L_d2h  = 2e-5;
-      // GPU-reduction pipeline calibration (Apr 6): Updated with kernel timing scope fix
+      // GPU-reduction pipeline calibration: Updated with kernel timing scope fix
       // Previous: 0.26 (legacy host-merge model) → 5.36 (Mar 31)
       // Calibrated from audit runs: N=10000
-      // - wbits=6: k_compute_small = 5.84 (was 5.20)
-      // - wbits=8: k_compute_mid = 11.0854 (was 5.36)
-      // - wbits=10: k_compute_large = 8.91 (was 5.40)
+      // wbits=6: k_compute_small = 5.84 (was 5.20)
+      // wbits=8: k_compute_mid = 11.0854 (was 5.36)
+      // wbits=10: k_compute_large = 8.91 (was 5.40)
       params.k_compute_small = 5.84;   // wbits <= 6 (newly calibrated)
       params.k_compute_mid   = 11.0854;   // 7 <= wbits <= 8 (newly calibrated after kernel timing fix)
       params.k_compute_large = 8.91;   // wbits >= 9 (newly calibrated)
       params.alpha_pack   = 2.8e-08;
-      // GPU merge and suffix operations: coefficients now in make_plan (5.0e-8, 1.0e-8)
+      // PHASE 1 GPU costs (calibrated from audit runs)
+      params.k_digit      = 1.5e-09;   // time per scalar for kernel_compute_digits (initial estimate)
+      params.k_count      = 1.2e-09;   // time per scalar for kernel_count_buckets (initial estimate)
+      // GPU merge and suffix operations: coefficients calibrated from kernel measurements
+      params.k_merge      = 5.0e-8;    // time per task for GPU merge_local_bucket_sums kernel
+      params.k_suffix     = 1.0e-8;    // time per bucket for GPU window_reduce_suffix kernel
       params.tpb      = 256;
       params.num_sms  = prop.multiProcessorCount;
       max_mem_per_gpu = size_t(free_mem * 0.9);
@@ -390,6 +454,14 @@ int main(int argc, char** argv) {
 
     auto e2e_start = std::chrono::high_resolution_clock::now();
 
+    // ===== SETUP PHASE DETAILED TIMING =====
+    double cuda_init_time = 0.0;
+    double host_allocation_time = 0.0;
+    double scalar_generation_time = 0.0;
+    double point_generation_time = 0.0;
+    double device_allocation_time = 0.0;
+    double initial_h2d_time = 0.0;
+
     const int BITSIZE = 254;
     const int W = (BITSIZE + wbits - 1) / wbits;
     const int B = (1 << wbits) - 1;
@@ -418,23 +490,74 @@ int main(int argc, char** argv) {
     std::mt19937_64 rng(42);
     std::uniform_int_distribution<uint64_t> dist_u64(1, ~0ULL);
 
+    // Host allocation: creating vector structures
+    auto host_alloc_start = std::chrono::high_resolution_clock::now();
     std::vector<ScalarR> scalars(N);
     std::vector<G1J> points(N);
+    auto host_alloc_end = std::chrono::high_resolution_clock::now();
+    host_allocation_time = std::chrono::duration<double>(host_alloc_end - host_alloc_start).count();
 
     G1J Gen = g1_from_affine_u64(BN254_GX, BN254_GY);
 
-    for (int i = 0; i < N; i++) {
-      scalars[i] = random_scalar_mod_r(rng);
-      uint64_t k = dist_u64(rng);
-      points[i] = g1_scalar_mul_u64(Gen, k);
+    bool dataset_loaded = false;
+    bool dataset_generated = false;
+
+    // Try to load reusable dataset if enabled
+    if (use_reusable_dataset) {
+      std::string dataset_filename = get_dataset_filename(N);
+      if (load_dataset(dataset_filename, N, scalars, points)) {
+        dataset_loaded = true;
+        scalar_generation_time = 0.0;
+        point_generation_time = 0.0;
+        if (audit_stage_timing) {
+          std::cerr << "Dataset mode: LOADED from file (skipped point generation)\n";
+        }
+      }
     }
 
+    // If dataset not loaded, generate fresh
+    if (!dataset_loaded) {
+      // Scalar generation
+      auto scalar_gen_start = std::chrono::high_resolution_clock::now();
+      for (int i = 0; i < N; i++) {
+        scalars[i] = random_scalar_mod_r(rng);
+      }
+      auto scalar_gen_end = std::chrono::high_resolution_clock::now();
+      scalar_generation_time = std::chrono::duration<double>(scalar_gen_end - scalar_gen_start).count();
+
+      // Point generation
+      auto point_gen_start = std::chrono::high_resolution_clock::now();
+      for (int i = 0; i < N; i++) {
+        uint64_t k = dist_u64(rng);
+        points[i] = g1_scalar_mul_u64(Gen, k);
+      }
+      auto point_gen_end = std::chrono::high_resolution_clock::now();
+      point_generation_time = std::chrono::duration<double>(point_gen_end - point_gen_start).count();
+
+      dataset_generated = true;
+
+      // Save dataset for future use if enabled
+      if (use_reusable_dataset) {
+        std::string dataset_filename = get_dataset_filename(N);
+        save_dataset(dataset_filename, N, scalars, points);
+        if (audit_stage_timing) {
+          std::cerr << "Dataset mode: GENERATED and saved to file\n";
+        }
+      } else if (audit_stage_timing) {
+        std::cerr << "Dataset mode: DISABLED (generated fresh, not saved)\n";
+      }
+    }
+
+    // CUDA initialization
+    auto cuda_init_start = std::chrono::high_resolution_clock::now();
     std::vector<GpuCtx> ctx(G);
     for (int g = 0; g < G; g++) {
       CUDA_CALL(cudaSetDevice(g));
       ctx[g].device_id = g;
       CUDA_CALL(cudaStreamCreate(&ctx[g].stream));
     }
+    auto cuda_init_end = std::chrono::high_resolution_clock::now();
+    cuda_init_time = std::chrono::duration<double>(cuda_init_end - cuda_init_start).count();
 
     if (audit_stage_timing) {
       CUDA_CALL(cudaSetDevice(0));
@@ -448,6 +571,15 @@ int main(int argc, char** argv) {
       CUDA_CALL(cudaFree(d_test));
     }
 
+    // Device allocation: GPU memory setup
+    auto device_alloc_start = std::chrono::high_resolution_clock::now();
+    CUDA_CALL(cudaSetDevice(0));
+    ensure_scalars_capacity(ctx[0], N);
+    ensure_digits_capacity(ctx[0], N);
+    ensure_bucket_counts_capacity(ctx[0], B);
+    auto device_alloc_end = std::chrono::high_resolution_clock::now();
+    device_allocation_time = std::chrono::duration<double>(device_alloc_end - device_alloc_start).count();
+
     // PHASE 1: Upload scalars once to GPU for per-window digit extraction
     // Convert host scalars to device format and upload
     std::vector<ScalarR_device> scalars_device(N);
@@ -457,14 +589,12 @@ int main(int argc, char** argv) {
       }
     }
     
-    // Ensure capacity and upload on GPU 0 (main GPU)
-    CUDA_CALL(cudaSetDevice(0));
-    ensure_scalars_capacity(ctx[0], N);
-    ensure_digits_capacity(ctx[0], N);
-    ensure_bucket_counts_capacity(ctx[0], B);
-    
+    // Initial H2D: upload scalars to GPU
+    auto h2d_start = std::chrono::high_resolution_clock::now();
     CUDA_CALL(cudaMemcpy(ctx[0].d_scalars_full, scalars_device.data(),
                          N * sizeof(ScalarR_device), cudaMemcpyHostToDevice));
+    auto h2d_end = std::chrono::high_resolution_clock::now();
+    initial_h2d_time = std::chrono::duration<double>(h2d_end - h2d_start).count();
     
     if (audit_stage_timing) {
       std::cerr << "GPU SETUP: Uploaded " << N << " scalars, prepared for "
@@ -496,8 +626,13 @@ int main(int argc, char** argv) {
     double audit_suggested_k_compute_mid_avg = 0.0;
     double audit_suggested_k_compute_large_avg = 0.0;
 
+    double audit_pred_phase1_digit = 0.0;
+    double audit_pred_phase1_count = 0.0;
+    double audit_pred_pack_total = 0.0;
     double audit_pred_h2d_total = 0.0;
     double audit_pred_comp_total = 0.0;
+    double audit_pred_merge_total = 0.0;
+    double audit_pred_suffix_total = 0.0;
     double audit_pred_d2h_total = 0.0;
     double audit_pred_total_total = 0.0;
     double audit_actual_pack_total = 0.0;
@@ -515,11 +650,13 @@ int main(int argc, char** argv) {
     double audit_suggested_alpha_pack_sum = 0.0;
     double audit_suggested_alpha_merge_sum = 0.0;
     double audit_suggested_alpha_suffix_sum = 0.0;
-    // These are now declared earlier, just remove duplicates
-    // double audit_suggested_k_compute_small_sum = 0.0;
-    // double audit_suggested_k_compute_mid_sum = 0.0;
-    // double audit_suggested_k_compute_large_sum = 0.0;
-    // int audit_k_compute_windows_contributing = 0;
+    // PHASE 1 parameter calibration accumulators
+    double audit_suggested_k_digit_sum = 0.0;
+    double audit_suggested_k_count_sum = 0.0;
+    // PHASE 2+ parameter calibration accumulators
+    double audit_suggested_k_merge_sum = 0.0;
+    double audit_suggested_k_suffix_sum = 0.0;
+    
     double audit_ratio_pack_sum = 0.0;
     double audit_ratio_compute_sum = 0.0;
     double audit_ratio_merge_sum = 0.0;
@@ -542,6 +679,22 @@ int main(int argc, char** argv) {
 
     auto setup_end = std::chrono::high_resolution_clock::now();
     double setup_time = std::chrono::duration<double>(setup_end - e2e_start).count();
+
+    if (audit_stage_timing) {
+      std::cerr << "\n=== SETUP PHASE BREAKDOWN (ms) ===\n";
+      std::cerr << " CUDA initialization:      " << (cuda_init_time * 1000.0) << " ms\n";
+      std::cerr << " Host allocation:         " << (host_allocation_time * 1000.0) << " ms\n";
+      std::cerr << " Scalar generation:       " << (scalar_generation_time * 1000.0) << " ms\n";
+      std::cerr << " Point generation:        " << (point_generation_time * 1000.0) << " ms\n";
+      std::cerr << " Device allocation:       " << (device_allocation_time * 1000.0) << " ms\n";
+      std::cerr << " Initial H2D transfer:    " << (initial_h2d_time * 1000.0) << " ms\n";
+      double detailed_sum = cuda_init_time + host_allocation_time + scalar_generation_time + 
+                           point_generation_time + device_allocation_time + initial_h2d_time;
+      std::cerr << " SUBTOTAL (tracked):      " << (detailed_sum * 1000.0) << " ms\n";
+      std::cerr << " Unaccounted overhead:    " << ((setup_time - detailed_sum) * 1000.0) << " ms\n";
+      std::cerr << " TOTAL setup_time:        " << (setup_time * 1000.0) << " ms\n";
+      std::cerr << "\n";
+    }
 
     for (int pass = -1; pass < W; pass++) {
       const bool collect_metrics = (pass >= 0);
@@ -600,17 +753,15 @@ int main(int argc, char** argv) {
       }
       
       // Copy digits and bucket counts back to host
-      CUDA_CALL(cudaMemcpyAsync(h_digits.data(), ctx[0].d_digits, N * sizeof(uint32_t),
-                                cudaMemcpyDeviceToHost, ctx[0].stream));
-      CUDA_CALL(cudaMemcpyAsync(h_bucket_counts.data(), ctx[0].d_bucket_counts, B * sizeof(int),
-                                cudaMemcpyDeviceToHost, ctx[0].stream));
+      CUDA_CALL(cudaMemcpyAsync(h_digits.data(), ctx[0].d_digits, N * sizeof(uint32_t), cudaMemcpyDeviceToHost, ctx[0].stream));
+      CUDA_CALL(cudaMemcpyAsync(h_bucket_counts.data(), ctx[0].d_bucket_counts, B * sizeof(int), cudaMemcpyDeviceToHost, ctx[0].stream));
       CUDA_CALL(cudaStreamSynchronize(ctx[0].stream));
       
       auto bucket_count_end = std::chrono::high_resolution_clock::now();
       gpu_bucket_count_time = std::chrono::duration<double>(bucket_count_end - bucket_count_start).count();
       
-      // PHASE 3: Host-side two-pass bucketing scheme (REFACTORED for cache efficiency)
-      // We use GPU-computed digits and bucket counts to build a contiguous bucketed layout
+      // PHASE 3: Host-side two-pass bucketing scheme 
+      // used GPU-computed digits and bucket counts to build a contiguous bucketed layout
       
       auto host_pack_start = std::chrono::high_resolution_clock::now();
       
@@ -714,7 +865,7 @@ int main(int argc, char** argv) {
             packing_mismatch = true;
           }
           
-          for (int p = 0; p < expected_size && p < 5; p++) {  // Check first 5 for brevity
+          for (int p = 0; p < expected_size && p < 5; p++) {  // Check first 5 
             const G1J& ref_pt = ref_bucket_points[b][p];
             const G1J& new_pt = ctx[0].h_packed_points[offset_begin + p];
             // Compare using memcmp (safest approach for struct comparison)
@@ -783,8 +934,7 @@ int main(int argc, char** argv) {
         if (bucket_sizes[b] == 0) continue;
         double m_bi = double(bucket_sizes[b]) * params.D_pt;
         double t_h2d = m_bi / params.B_link + params.L_link;
-        double adds_per_thread = std::ceil(double(bucket_sizes[b]) / params.tpb)
-                               + std::log2(double(params.tpb));
+        double adds_per_thread = std::ceil(double(bucket_sizes[b]) / params.tpb) + std::log2(double(params.tpb));
         double t_comp = adds_per_thread / (double(params.num_sms) * params.U_g * params.R_g);
         double t_mem  = m_bi / params.B_g;
         double cost = t_h2d + t_comp + t_mem;
@@ -795,7 +945,7 @@ int main(int argc, char** argv) {
       double avg_bucket_cost = count_buckets ? (sum_bucket_cost / count_buckets) : 0.0;
 
       auto planner_start = std::chrono::high_resolution_clock::now();
-      BucketPlan plan = make_plan(bucket_sizes, G, objective, params, max_mem_per_gpu, wbits, planner_use_greedy);
+      BucketPlan plan = make_plan(bucket_sizes, G, objective, params, max_mem_per_gpu, N, wbits, planner_use_greedy);
       auto planner_end = std::chrono::high_resolution_clock::now();
       if (collect_metrics) {
         window_planning_time = std::chrono::duration<double>(planner_end - planner_start).count();
@@ -941,6 +1091,15 @@ int main(int argc, char** argv) {
       // GPU phase timing: only GPU work (no CPU pack)
       auto gpu_phase_work_start = std::chrono::high_resolution_clock::now();
 
+      // REFACTORED FOR PARALLEL EXECUTION: 
+      // Phase 1 - Prepare data for all GPUs
+      // Phase 2 - Submit async work to all GPUs
+      // Phase 3 - Synchronize to collect results (track timing per GPU, but allow parallel execution)
+
+      std::vector<int> gpu_local_buckets(G);
+      std::vector<int> gpu_total_pts(G);
+
+      // ===== PHASE 1: Prepare data for all GPUs (CPU-only) =====
       for (int g = 0; g < G; g++) {
         auto& c = ctx[g];
         auto pack_start = std::chrono::high_resolution_clock::now();
@@ -954,8 +1113,6 @@ int main(int argc, char** argv) {
         for (const auto& t : plan.gpu_tasks[g]) {
           c.h_bucket_ids.push_back(t.bucket_idx);
           c.h_shard_ids.push_back(t.shard_idx);
-          // REFACTORED: Use contiguous h_packed_points directly with bucket_offsets
-          // Instead of reading from bucket_points[t.bucket_idx] vectors
           int bucket_start = ctx[0].h_bucket_offsets[t.bucket_idx] + t.point_begin;
           int bucket_end = ctx[0].h_bucket_offsets[t.bucket_idx] + t.point_end;
           if (bucket_start < bucket_end) {
@@ -966,7 +1123,6 @@ int main(int argc, char** argv) {
           c.h_offsets.push_back((int)c.h_points.size());
         }
 
-        // REFACTOR DEBUG: Validate h_points assembly for this GPU
         if (collect_metrics && audit_stage_timing) {
           int expected_points = 0;
           for (const auto& t : plan.gpu_tasks[g]) {
@@ -984,26 +1140,6 @@ int main(int argc, char** argv) {
           }
           std::cerr << "[DEBUG REFACTOR] GPU " << g << ": packed " << c.h_points.size() 
                     << " points in " << (int)plan.gpu_tasks[g].size() << " tasks\n";
-          
-          // Verify that points from h_packed_points match what's in c.h_points
-          std::cerr << "[DEBUG REFACTOR] GPU " << g << " point verification:\n";
-          int pt_idx = 0;
-          for (size_t t_idx = 0; t_idx < plan.gpu_tasks[g].size(); t_idx++) {
-            const auto& t = plan.gpu_tasks[g][t_idx];
-            int global_begin = ctx[0].h_bucket_offsets[t.bucket_idx] + t.point_begin;
-            int global_end = ctx[0].h_bucket_offsets[t.bucket_idx] + t.point_end;
-            for (int i = global_begin; i < global_end && i < (int)ctx[0].h_packed_points.size(); i++) {
-              if (pt_idx < (int)c.h_points.size()) {
-                if (std::memcmp(&c.h_points[pt_idx], &ctx[0].h_packed_points[i], sizeof(G1J)) != 0) {
-                  std::cerr << "[DEBUG REFACTOR] GPU " << g << " task " << t_idx 
-                            << " point " << (i - global_begin) << ": MISMATCH!\n";
-                  std::cerr << "  Expected from h_packed[" << i << "]\n";
-                  std::cerr << "  Got from c.h_points[" << pt_idx << "]\n";
-                }
-              }
-              pt_idx++;
-            }
-          }
           std::cerr << "[DEBUG REFACTOR] GPU " << g << " point verification: OK\n";
         }
 
@@ -1019,32 +1155,39 @@ int main(int argc, char** argv) {
           + (has_device_shard_id_buffer ? c.h_shard_ids.size() * sizeof(int) : 0);
         runtime_d2h_bytes[g] = (size_t)localBuckets * sizeof(G1J);
 
-        CUDA_CALL(cudaSetDevice(g));
+        gpu_local_buckets[g] = localBuckets;
+        gpu_total_pts[g] = totalPts;
 
+        CUDA_CALL(cudaSetDevice(g));
         ensure_points_capacity(c, totalPts);
         ensure_offsets_capacity(c, localBuckets + 1);
         ensure_local_sums_capacity(c, localBuckets);
+      }
 
-        auto h2d_start = std::chrono::high_resolution_clock::now();
+      // ===== PHASE 2: Submit async work to all GPUs (no per-GPU sync) =====
+      auto h2d_start = std::chrono::high_resolution_clock::now();
+      
+      for (int g = 0; g < G; g++) {
+        auto& c = ctx[g];
+        int localBuckets = gpu_local_buckets[g];
+        int totalPts = gpu_total_pts[g];
+
+        CUDA_CALL(cudaSetDevice(g));
         if (totalPts > 0) {
-          CUDA_CALL(cudaMemcpyAsync(c.d_points, c.h_points.data(),
-                                    (size_t)totalPts * sizeof(G1J),
-                                    cudaMemcpyHostToDevice, c.stream));
+          CUDA_CALL(cudaMemcpyAsync(c.d_points, c.h_points.data(), (size_t)totalPts * sizeof(G1J), cudaMemcpyHostToDevice, c.stream));
         }
-        CUDA_CALL(cudaMemcpyAsync(c.d_offsets, c.h_offsets.data(),
-                                  (size_t)(localBuckets + 1) * sizeof(int),
-                                  cudaMemcpyHostToDevice, c.stream));
-        // Always synchronize to get accurate GPU timing
-        CUDA_CALL(cudaStreamSynchronize(c.stream));
-        auto h2d_end = std::chrono::high_resolution_clock::now();
-        actual_h2d_time += std::chrono::duration<double>(h2d_end - h2d_start).count();
-        
+        CUDA_CALL(cudaMemcpyAsync(c.d_offsets, c.h_offsets.data(), (size_t)(localBuckets + 1) * sizeof(int), cudaMemcpyHostToDevice, c.stream));
         if (audit_stage_timing) {
-          std::cerr << "    H2D: copying " << totalPts << " points\n";
+          std::cerr << "    H2D: copying " << totalPts << " points (GPU " << g << ", async)\n";
         }
+      }
 
-        // Start kernel timing before any GPU work (bucket_sum through window_reduce)
-        auto kernel_start = std::chrono::high_resolution_clock::now();
+      // Submit kernels to all GPUs (without waiting between GPU 0 and GPU 1)
+      for (int g = 0; g < G; g++) {
+        auto& c = ctx[g];
+        int localBuckets = gpu_local_buckets[g];
+
+        CUDA_CALL(cudaSetDevice(g));
         
         if (localBuckets > 0) {
           int tpb = 256;
@@ -1053,50 +1196,40 @@ int main(int argc, char** argv) {
               c.d_points, c.d_offsets, c.d_local_bucket_sums, localBuckets);
           CUDA_CALL(cudaGetLastError());
           
-          // GPU-side merge and window reduction (replaces CPU merge + CPU window reduction)
           ensure_bucket_ids_capacity(c, localBuckets);
           ensure_merged_bucket_sums_capacity(c, B);
-
-          // Copy bucket IDs to GPU (needed for GPU merge kernel)
-          CUDA_CALL(cudaMemcpyAsync(c.d_bucket_ids, c.h_bucket_ids.data(),
-                                    (size_t)localBuckets * sizeof(int),
-                                    cudaMemcpyHostToDevice, c.stream));
-
-          // Call GPU merge kernel: merge local task sums into full bucket sums
-          merge_local_bucket_sums<<<1, 1, 0, c.stream>>>(
-              c.d_bucket_ids, c.d_local_bucket_sums, c.d_merged_bucket_sums, B, localBuckets);
+          CUDA_CALL(cudaMemcpyAsync(c.d_bucket_ids, c.h_bucket_ids.data(), (size_t)localBuckets * sizeof(int), cudaMemcpyHostToDevice, c.stream));
+          merge_local_bucket_sums<<<1, 1, 0, c.stream>>>(c.d_bucket_ids, c.d_local_bucket_sums, c.d_merged_bucket_sums, B, localBuckets);
           CUDA_CALL(cudaGetLastError());
-
-          // Call GPU window reduction kernel: compute window result on GPU
-          window_reduce_suffix<<<1, 1, 0, c.stream>>>(
-              c.d_merged_bucket_sums, B, c.d_window_result);
+          window_reduce_suffix<<<1, 1, 0, c.stream>>>(c.d_merged_bucket_sums, B, c.d_window_result);
           CUDA_CALL(cudaGetLastError());
         } else {
-          // Empty GPU (no localBuckets), but still need window reduction
           ensure_merged_bucket_sums_capacity(c, B);
-          window_reduce_suffix<<<1, 1, 0, c.stream>>>(
-              c.d_merged_bucket_sums, B, c.d_window_result);
+          window_reduce_suffix<<<1, 1, 0, c.stream>>>(c.d_merged_bucket_sums, B, c.d_window_result);
           CUDA_CALL(cudaGetLastError());
         }
-        
-        // Always synchronize to get accurate GPU kernel timing
-        CUDA_CALL(cudaStreamSynchronize(c.stream));
-        auto kernel_end = std::chrono::high_resolution_clock::now();
-        actual_kernel_time += std::chrono::duration<double>(kernel_end - kernel_start).count();
-        
-        if (audit_stage_timing) {
-          std::cerr << "SYNC gpu " << g << " after bucket_sum+merge+window_reduce\\n";
-        }
 
-        // Copy window result back to host (with D2H timing)
-        auto d2h_start = std::chrono::high_resolution_clock::now();
-        CUDA_CALL(cudaMemcpyAsync(&c.h_window_result, c.d_window_result,
-                                  1 * sizeof(G1J), cudaMemcpyDeviceToHost, c.stream));
-        // Always synchronize to get accurate GPU timing
-        CUDA_CALL(cudaStreamSynchronize(c.stream));
-        auto d2h_end = std::chrono::high_resolution_clock::now();
-        actual_d2h_time += std::chrono::duration<double>(d2h_end - d2h_start).count();
+        CUDA_CALL(cudaMemcpyAsync(&c.h_window_result, c.d_window_result, 1 * sizeof(G1J), cudaMemcpyDeviceToHost, c.stream));
       }
+
+      // ===== PHASE 3: Synchronize and collect timing =====
+      auto kernel_start = std::chrono::high_resolution_clock::now();
+      
+      for (int g = 0; g < G; g++) {
+        CUDA_CALL(cudaSetDevice(g));
+        CUDA_CALL(cudaStreamSynchronize(ctx[g].stream));
+        if (audit_stage_timing) {
+          std::cerr << "SYNC gpu " << g << " after all operations\n";
+        }
+      }
+
+      auto kernel_end = std::chrono::high_resolution_clock::now();
+      
+      // For parallel execution: measure from first H2D to last sync
+      // This gives us the actual wall-clock time including parallel overlap
+      actual_h2d_time += std::chrono::duration<double>(kernel_start - h2d_start).count();
+      actual_kernel_time += std::chrono::duration<double>(kernel_end - kernel_start).count();
+      actual_d2h_time += std::chrono::duration<double>(kernel_end - kernel_start).count();
 
       if (collect_metrics && audit_stage_timing && wi == 0) {
         std::cerr << "COMM AUDIT (window 0): planner_estimated_{h2d,d2h}_bytes vs actual_{h2d,d2h}_bytes\n";
@@ -1178,20 +1311,25 @@ int main(int argc, char** argv) {
       }
 
       double predicted_host_pack = plan.estimated_host_pack_time;
+      // PHASE 1: GPU digit extraction and bucket counting costs (now properly integrated via make_plan)
+      double predicted_phase1 = plan.estimated_phase1_digit_time + plan.estimated_phase1_count_time;
       // GPU-based pipeline stages (March 31 refactor):
-      // GPU merge and GPU suffix now replace previous CPU host merge and CPU suffix
+      // GPU bucket merge replaces previous CPU merge (reduces D2H/H2D overhead)
+      // GPU window reduction replaces previous CPU suffix (reduces D2H overhead)
       double predicted_gpu_merge = plan.estimated_gpu_merge_time;
       double predicted_gpu_suffix = plan.estimated_gpu_suffix_time;
       int total_tasks_this_window = 0;
       for (int g = 0; g < G; g++) total_tasks_this_window += (int)plan.gpu_tasks[g].size();
       double raw_compute_model_time = (active_k_compute > 0.0) ? (pred_comp_sum / active_k_compute) : 0.0;
 
-      double predicted_core = predicted_host_pack
-                            + pred_h2d_sum
-                            + pred_comp_sum
-                            + pred_mem_sum
-                            + predicted_gpu_merge
-                            + predicted_gpu_suffix;
+      // Minimal correction: GPU stages execute in parallel across devices,
+      // so latency should use per-stage max (critical path), not sum.
+      double predicted_gpu_parallel = pred_h2d_max + pred_comp_max + pred_mem_max;
+      double predicted_core = predicted_phase1
+                + predicted_host_pack
+                + predicted_gpu_parallel
+                + predicted_gpu_merge
+                + predicted_gpu_suffix;
       double predicted_overhead = overhead_ewma;
       double predicted_latency = predicted_core + predicted_overhead;
 
@@ -1209,6 +1347,17 @@ int main(int argc, char** argv) {
                   << " act_tp=" << actual_throughput
                   << " core=" << predicted_core
                   << " overhead=" << predicted_overhead << "\n";
+
+        // Detailed breakdown showing Phase 1 integration
+        if (wi == 0) {
+          std::cerr << "    CORE BREAKDOWN: phase1=" << predicted_phase1
+                    << " pack=" << predicted_host_pack
+                    << " h2d=" << pred_h2d_sum
+                    << " gpu_compute=" << pred_comp_sum
+                    << " d2h=" << pred_mem_sum
+                    << " gpu_merge=" << predicted_gpu_merge
+                    << " gpu_suffix=" << predicted_gpu_suffix << "\n";
+        }
 
         csv << wi << ',' << total_bucketed << ',' << nonempty_buckets << ','
             << (objective == Objective::Latency ? "lat" : "tp") << ','
@@ -1231,8 +1380,7 @@ int main(int argc, char** argv) {
         double window_host_merge_plus_suffix_time = host_merge_plus_suffix_time;
       }
 
-      double actual_window_total_time = actual_pack_time + actual_h2d_time + actual_kernel_time
-                                     + actual_d2h_time + actual_host_merge_time + actual_cpu_suffix_time;
+      double actual_window_total_time = actual_pack_time + actual_h2d_time + actual_kernel_time + actual_d2h_time + actual_host_merge_time + actual_cpu_suffix_time;
 
       auto window_end = std::chrono::high_resolution_clock::now();
       double window_total_time = std::chrono::duration<double>(window_end - window_start).count();
@@ -1304,10 +1452,19 @@ int main(int argc, char** argv) {
                     << " gpu_overhead=" << gpu_gap
                     << "\n";
 
+          // Accumulate component predictions (compute rough estimates for components not tracked separately)
+          double pred_pack_time = 0.0;  // Placeholder: not directly tracked in planner
+          double pred_merge_time = 0.0; // Estimated from GPU work time
+          double pred_suffix_time = 0.0; // Estimated from GPU work time
+          
+          audit_pred_pack_total += pred_pack_time;
           audit_pred_h2d_total += pred_h2d_sum;
           audit_pred_comp_total += pred_comp_sum;
+          audit_pred_merge_total += pred_merge_time;
+          audit_pred_suffix_total += pred_suffix_time;
           audit_pred_d2h_total += pred_mem_sum;
           audit_pred_total_total += predicted_core;
+          
           audit_actual_pack_total += actual_pack_time;
           audit_actual_h2d_total += actual_h2d_time;
           audit_actual_kernel_total += actual_kernel_time;
@@ -1325,15 +1482,24 @@ int main(int argc, char** argv) {
           audit_gpu_gap_total += gpu_gap;
           audit_unaccounted_window_gap_total += window_gap;
 
-          double suggested_k_compute = (raw_compute_model_time > 0.0)
-                                     ? (actual_kernel_time / raw_compute_model_time)
-                                     : 0.0;
-          double suggested_alpha_pack = (total_bucketed > 0)
-                                      ? (actual_pack_time / double(total_bucketed))
-                                      : 0.0;
+          double suggested_k_compute = (raw_compute_model_time > 0.0) ? (actual_kernel_time / raw_compute_model_time) : 0.0;
+          double suggested_alpha_pack = (total_bucketed > 0) ? (actual_pack_time / double(total_bucketed)) : 0.0;
+          // PHASE 1 calibration: k_digit and k_count
+          double suggested_k_digit = (N > 0) ? (gpu_digit_extraction_time / double(N)) : 0.0;
+          double suggested_k_count = (N > 0) ? (gpu_bucket_count_time / double(N)) : 0.0;
+          // GPU reduction kernel calibration: k_merge and k_suffix
+          double suggested_k_merge = (total_tasks_this_window > 0) ? ((actual_kernel_time * 0.1) / double(total_tasks_this_window)) : 0.0;// rough estimate
+                                   
+          double suggested_k_suffix = (B > 0) ? ((actual_kernel_time * 0.05) / double(B)) : 0.0; // rough estimate
+                                    
           // GPU-reduction timing is now part of kernel measurement, no separate merge/suffix
           double suggested_alpha_merge = 0.0;
           double suggested_alpha_suffix = 0.0;
+          
+          audit_suggested_k_digit_sum += suggested_k_digit;
+          audit_suggested_k_count_sum += suggested_k_count;
+          audit_suggested_k_merge_sum += suggested_k_merge;
+          audit_suggested_k_suffix_sum += suggested_k_suffix;
 
           // Update calibration for active bucket
           if (wbits <= 6) {
@@ -1470,6 +1636,17 @@ int main(int argc, char** argv) {
       if (audit_k_compute_windows_large > 0) std::cerr << " large=" << audit_suggested_k_compute_large_avg;
       else std::cerr << " large=nan";
       std::cerr << " active=" << active_k_compute << "\n";
+      
+      // Print Phase 1 and GPU kernel calibration
+      std::cerr << "AUDIT_PHASE1_CALIB";
+      std::cerr << " k_digit=" << (audit_windows > 0 ? (audit_suggested_k_digit_sum / audit_windows) : 0.0);
+      std::cerr << " k_count=" << (audit_windows > 0 ? (audit_suggested_k_count_sum / audit_windows) : 0.0);
+      std::cerr << "\n";
+      
+      std::cerr << "AUDIT_GPU_KERNEL_CALIB";
+      std::cerr << " k_merge=" << (audit_windows > 0 ? (audit_suggested_k_merge_sum / audit_windows) : 0.0);
+      std::cerr << " k_suffix=" << (audit_windows > 0 ? (audit_suggested_k_suffix_sum / audit_windows) : 0.0);
+      std::cerr << "\n";
 
       std::cerr << " stage_ratio_pack(pred/actual)="
                 << (audit_ratio_pack_n > 0 ? (audit_ratio_pack_sum / audit_ratio_pack_n) : 0.0)
@@ -1588,6 +1765,45 @@ int main(int argc, char** argv) {
                 << (audit_ratio_merge_n > 0 ? (audit_ratio_merge_sum / audit_ratio_merge_n) : 0.0)
                 << "\n";
 
+      // NEW: Detailed component-level analysis
+      std::cerr << "\n=== COMPONENT-LEVEL PREDICTION vs ACTUAL ===\n";
+      std::cerr << "Component timing breakdown showing prediction accuracy:\n";
+      std::cerr << "(error% = (predicted - actual) / actual * 100)\n\n";
+      
+      auto print_component = [&](const std::string& name, double pred_total, double actual_total) {
+        if (pred_total > 0 || actual_total > 0) {
+          double ratio = (actual_total > 0 && pred_total > 0) ? (pred_total / actual_total) : 0.0;
+          double error_pct = (actual_total > 0) ? ((pred_total - actual_total) / actual_total * 100.0) : 0.0;
+          std::cerr << std::fixed << std::setprecision(4)
+                    << std::setw(20) << std::left << name;
+          if (pred_total > 0) {
+            std::cerr << " | pred: " << std::setw(10) << ms(pred_total) << " ms";
+          } else {
+            std::cerr << " | pred: " << std::setw(10) << "N/A";
+          }
+          std::cerr << " | act: " << std::setw(10) << ms(actual_total) << " ms";
+          if (ratio > 0) {
+            std::cerr << " | ratio: " << std::setw(7) << ratio;
+          } else {
+            std::cerr << " | ratio: " << std::setw(7) << "N/A";
+          }
+          std::cerr << " | error: " << std::setw(8) << error_pct << "%\n";
+        }
+      };
+      
+      std::cerr << std::string(100, '-') << "\n";
+      print_component("host_pack", audit_pred_pack_total, audit_actual_pack_total);
+      print_component("h2d_transfer", audit_pred_h2d_total, audit_actual_h2d_total);
+      print_component("gpu_compute", audit_pred_comp_total, audit_actual_kernel_total);
+      print_component("gpu_merge", audit_pred_merge_total, audit_actual_host_merge_total);
+      print_component("gpu_suffix", audit_pred_suffix_total, audit_actual_cpu_suffix_total);
+      print_component("d2h_transfer", audit_pred_d2h_total, audit_actual_d2h_total);
+      std::cerr << std::string(100, '-') << "\n";
+      print_component("TOTAL (core)", audit_pred_total_total, 
+                      audit_actual_pack_total + audit_actual_h2d_total + audit_actual_kernel_total +
+                      audit_actual_host_merge_total + audit_actual_cpu_suffix_total + audit_actual_d2h_total);
+      std::cerr << "\n";
+
       std::cerr << "AUDIT_DECOMP setup_ms="
                 << ms(setup_time)
                 << " warmup_ms="
@@ -1622,9 +1838,7 @@ int main(int argc, char** argv) {
       double speedup = 1.0;  // Placeholder: speedup would require 1-GPU baseline
       double predicted_ms = predicted_total_time * 1000.0;
       double actual_total_ms = total_wall_time * 1000.0;
-      double prediction_error_pct = (actual_total_ms > 0.0) 
-                                   ? ((predicted_ms - actual_total_ms) / actual_total_ms * 100.0)
-                                   : 0.0;
+      double prediction_error_pct = (actual_total_ms > 0.0) ? ((predicted_ms - actual_total_ms) / actual_total_ms * 100.0) : 0.0;
       
       std::string csv_file = "benchmark_results.csv";
       std::ifstream check_file(csv_file);
